@@ -3211,12 +3211,14 @@ void LineAnnotationDialog::updateStripRenderLevelFloors()
         }
         // The strip quad has one column per line sample, so the true footprint
         // is spacingVx volume voxels per screen pixel at zoom 1 -- which the
-        // viewer's zoom-only LOD pick cannot see. Match its 0.5 zoom bias.
+        // viewer's zoom-only LOD pick cannot see. The 0.25 factor picks one
+        // level finer than the exact footprint match (sharper strips at a
+        // modest chunk-footprint cost).
         int minLevel = 0;
         const double volumeVxPerScreenPx = spacingVx / static_cast<double>(zoom);
         if (volumeVxPerScreenPx > 1.0) {
             minLevel = std::clamp(
-                static_cast<int>(std::floor(std::log2(volumeVxPerScreenPx * 0.5))),
+                static_cast<int>(std::floor(std::log2(volumeVxPerScreenPx * 0.25))),
                 0,
                 8);
         }
