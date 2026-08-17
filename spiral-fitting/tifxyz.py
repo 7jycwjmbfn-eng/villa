@@ -432,6 +432,14 @@ def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source):
     with open(f'{path}/meta.json', 'w') as f:
         json.dump({
             'scale': [1 / step_size, 1 / step_size],
+            # The edge length of the voxels x/y/z.tif are counted in. Nothing
+            # else in the format says which pyramid level the coordinates
+            # address, so every consumer has had to obtain it some other way:
+            # vc_render_tifxyz assumes group 0 and expects the caller to correct
+            # it with --scale-segmentation, infer_full3d_tifxyz takes it as a
+            # command-line argument, and tifxyz_label_transfer parses it out of
+            # the directory name. It is already an argument here.
+            'voxel_size_um': voxel_size_um,
             'bbox': bbox,
             'area_vx2': area_vx2,
             'area_cm2': area_vx2 * voxel_size_um ** 2 / 1.e8,
@@ -551,6 +559,9 @@ def save_combined_tifxyz(
         )
         metadata = {
             "scale": [1 / step_size, 1 / step_size],
+            # See save_tifxyz: the voxel edge length the coordinates are
+            # counted in, which the format otherwise does not record.
+            "voxel_size_um": voxel_size_um,
             "bbox": bbox,
             "area_vx2": area_vx2,
             "area_cm2": area_vx2 * voxel_size_um ** 2 / 1.e8,

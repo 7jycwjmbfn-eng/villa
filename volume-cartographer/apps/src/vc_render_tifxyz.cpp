@@ -684,6 +684,13 @@ static void renderBands(
 // TIFF band writer helper
 // ============================================================
 
+// Total intensity written to TIFF, over every band and every output path.
+// A segmentation whose coordinates address a different voxel space than the
+// requested group still renders: the tool exits 0 and writes a correctly sized
+// image in which every pixel is zero. Sample values are unsigned, so a zero
+// total is exactly "nothing was written".
+static std::atomic<uint64_t> g_tifIntensity{0};
+
 static void writeTifBand(std::vector<TiffWriter>& writers,
                           const std::vector<cv::Mat>& slices,
                           uint32_t bandY0, uint32_t tiffTileH,
@@ -694,6 +701,13 @@ static void writeTifBand(std::vector<TiffWriter>& writers,
         for (uint32_t ty = 0; ty < uint32_t(slices[zi].rows); ty += tiffTileH) {
             uint32_t tdy = std::min(tiffTileH, uint32_t(slices[zi].rows) - ty);
             cv::Mat sub = slices[zi](cv::Rect(0, ty, slices[zi].cols, tdy));
+            if (g_tifIntensity.load(std::memory_order_relaxed) == 0) {
+                cv::Scalar total = cv::sum(sub);
+                double band = total[0] + total[1] + total[2] + total[3];
+                if (band > 0)
+                    g_tifIntensity.fetch_add(uint64_t(band),
+                                             std::memory_order_relaxed);
+            }
             int dstBx, dstBy, rBX, rBY;
             uint32_t srcTileIdx = (bandY0 + ty) / tiffTileH;
             mapTileIndex(0, int(srcTileIdx), 1, int(numTiffTiles),
@@ -1403,6 +1417,10 @@ int main(int argc, char *argv[])
     // --- Resolve voxel size for OME-Zarr metadata ---
     const std::string voxel_unit = parsed["voxel-unit"].as<std::string>();
     double base_voxel_size = 1.0;
+    // The same size in micrometres, or 0 when unknown. base_voxel_size is in
+    // voxel_unit, which defaults to nanometre, so it cannot be compared with a
+    // segmentation's voxel_size_um directly.
+    double base_voxel_size_um = 0.0;
     bool hasPhysicalVoxelSize = false;
     bool voxelSizeFromCli = false;
     if (parsed.count("voxel-size")) {
@@ -1441,6 +1459,7 @@ int main(int argc, char *argv[])
                 return EXIT_FAILURE;
             }
         }
+        base_voxel_size_um = voxelSizeUm;
         // TIFF resolution describes output *pixels*: one pixel spans
         // 1/tgt_scale level-g voxels (--scale is pixels per level-g voxel).
         const double umPerOutputPixel = (ds_scale > 0 && tgt_scale > 0)
@@ -1495,6 +1514,44 @@ int main(int argc, char *argv[])
         try { surf = load_quad_from_tifxyz(seg_folder); }
         catch (...) { logPrintf(stderr, "Error loading: %s\n", seg_folder.string().c_str()); return false; }
 
+        // Volume coordinates are the segmentation's coordinates times this
+        // factor times 2^-group, so the default of 1 assumes the coordinates
+        // count group-0 voxels. tifxyz has no field for the pyramid level, so
+        // that assumption cannot be checked and a segmentation written at any
+        // other level renders as a correctly sized, entirely blank image. When
+        // meta.json states the voxel size, derive the factor from it instead.
+        float seg_scale = scale_seg;
+        if (parsed["scale-segmentation"].defaulted() && base_voxel_size_um > 0.0
+                && surf->meta.contains("voxel_size_um")
+                && surf->meta["voxel_size_um"].is_number()) {
+            const double segUm = surf->meta["voxel_size_um"].get_double();
+            const double derived = segUm / base_voxel_size_um;
+            // Pyramid levels differ by powers of two by construction, so any
+            // other ratio means one of the two numbers is wrong -- most likely
+            // --voxel-unit, which defaults to nanometre while a volume's own
+            // metadata is read as micrometres. Refusing those is not just
+            // tidiness: a ratio of 4000 asks for a 13-million-pixel-wide
+            // render before anything can report that it is nonsense.
+            if (std::isfinite(segUm) && segUm > 0.0
+                    && std::isfinite(derived) && derived > 0.0) {
+                const double exponent = std::log2(derived);
+                if (std::abs(exponent - std::round(exponent)) < 0.01) {
+                    seg_scale = float(derived);
+                    logPrintf(stdout,
+                        "Segmentation voxel size %g um, volume %g um: "
+                        "using --scale-segmentation %g\n",
+                        segUm, base_voxel_size_um, derived);
+                } else {
+                    logPrintf(stderr,
+                        "Warning: the segmentation states %g um per voxel and "
+                        "the volume is %g um, a ratio of %g. Pyramid levels "
+                        "differ by powers of two, so check --voxel-size and "
+                        "--voxel-unit; leaving --scale-segmentation at %g.\n",
+                        segUm, base_voxel_size_um, derived, double(scale_seg));
+                }
+            }
+        }
+
         if (parsed["flatten"].as<bool>()) {
             logPrintf(stdout, "Applying ABF++ flattening...\n");
             vc::ABFConfig cfg;
@@ -1535,7 +1592,7 @@ int main(int argc, char *argv[])
             double d = cv::determinant(cv::Mat(A));
             if (std::isfinite(d) && std::abs(d) > 1e-18) sA = std::cbrt(std::abs(d));
         }
-        double render_scale = double(tgt_scale) * (double(scale_seg) * sA * double(ds_scale));
+        double render_scale = double(tgt_scale) * (double(seg_scale) * sA * double(ds_scale));
 
         {
             double sx = render_scale / surf->_scale[0], sy = render_scale / surf->_scale[1];
@@ -1718,7 +1775,7 @@ int main(int argc, char *argv[])
             auto prefetchKeys = collectPrefetchKeysForRows(
                 surf.get(), chunk_cache, cacheLevel,
                 full_size, crop, tgt_size,
-                float(render_scale), scale_seg, ds_scale,
+                float(render_scale), seg_scale, ds_scale,
                 hasAffine, affineTransform,
                 rowStart, rowEnd, kPrefetchBandH,
                 num_slices, slice_step, accumOffsets,
@@ -1739,7 +1796,7 @@ int main(int argc, char *argv[])
                 // Tile-based: OMP-parallel over output zarr chunks
                 if (useU16)
                     renderTiles<uint16_t>(surf.get(), chunk_cache, chunk_cache, cacheLevel,
-                        full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
+                        full_size, crop, tgt_size, float(render_scale), seg_scale, ds_scale,
                         hasAffine, affineTransform, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
                         compositeParams, rotQuad, flip_axis, numParts, partId, cvType,
@@ -1749,7 +1806,7 @@ int main(int argc, char *argv[])
                         resumeFlag);
                 else
                     renderTiles<uint8_t>(surf.get(), chunk_cache, chunk_cache, cacheLevel,
-                        full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
+                        full_size, crop, tgt_size, float(render_scale), seg_scale, ds_scale,
                         hasAffine, affineTransform, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
                         compositeParams, rotQuad, flip_axis, numParts, partId, cvType,
@@ -1781,19 +1838,31 @@ int main(int argc, char *argv[])
 
                 if (useU16)
                     renderBands<uint16_t>(surf.get(), chunk_cache, chunk_cache, cacheLevel,
-                        full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
+                        full_size, crop, tgt_size, float(render_scale), seg_scale, ds_scale,
                         hasAffine, affineTransform, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
                         compositeParams, rotQuad, flip_axis, numParts, partId, cvType, bandH, writerFn);
                 else
                     renderBands<uint8_t>(surf.get(), chunk_cache, chunk_cache, cacheLevel,
-                        full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
+                        full_size, crop, tgt_size, float(render_scale), seg_scale, ds_scale,
                         hasAffine, affineTransform, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
                         compositeParams, rotQuad, flip_axis, numParts, partId, cvType, bandH, writerFn);
             }
 
             tifWriters.clear();
+
+            if (g_tifIntensity.load() == 0) {
+                logPrintf(stderr,
+                    "Warning: every rendered pixel is zero -- the output is blank.\n"
+                    "  Volume coordinates are the segmentation's coordinates times\n"
+                    "  --scale-segmentation (%g) times 2^-group (%g), so a segmentation\n"
+                    "  written in group-N voxels rather than group-0 voxels needs\n"
+                    "  --scale-segmentation 2^N. This group needs %g for coordinates\n"
+                    "  already at group %d.\n",
+                    double(seg_scale), double(ds_scale),
+                    std::ldexp(1.0, group_idx), group_idx);
+            }
         }
 
         // ---- Zarr pyramid + attrs ----
