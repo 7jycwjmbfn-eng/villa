@@ -365,86 +365,6 @@ static std::vector<float> buildCompositeOffsetList(
     return out;
 }
 
-struct ChunkRegion {
-    int minIz = 0, maxIz = -1;
-    int minIy = 0, maxIy = -1;
-    int minIx = 0, maxIx = -1;
-
-    [[nodiscard]] bool valid() const
-    {
-        return minIz <= maxIz && minIy <= maxIy && minIx <= maxIx;
-    }
-};
-
-static ChunkRegion computeChunkRegionForSamples(
-    const cv::Mat_<cv::Vec3f>& base,
-    const cv::Mat_<cv::Vec3f>& dirs,
-    const std::vector<float>& offsets,
-    vc::render::IChunkedArray* ds,
-    int level)
-{
-    ChunkRegion invalid;
-    if (!ds || base.empty() || offsets.empty()) return invalid;
-
-    float loX = std::numeric_limits<float>::max();
-    float loY = std::numeric_limits<float>::max();
-    float loZ = std::numeric_limits<float>::max();
-    float hiX = std::numeric_limits<float>::lowest();
-    float hiY = std::numeric_limits<float>::lowest();
-    float hiZ = std::numeric_limits<float>::lowest();
-    bool found = false;
-
-    auto updateBounds = [&](int r, int c) {
-        const auto& pt = base(r, c);
-        if (!std::isfinite(pt[0]) || !std::isfinite(pt[1]) || !std::isfinite(pt[2])) return;
-
-        const auto& dir = dirs(r, c);
-        for (float off : offsets) {
-            float px = pt[0] + dir[0] * off;
-            float py = pt[1] + dir[1] * off;
-            float pz = pt[2] + dir[2] * off;
-            loX = std::min(loX, px); hiX = std::max(hiX, px);
-            loY = std::min(loY, py); hiY = std::max(hiY, py);
-            loZ = std::min(loZ, pz); hiZ = std::max(hiZ, pz);
-            found = true;
-        }
-    };
-
-    const int h = base.rows;
-    const int w = base.cols;
-    for (int c = 0; c < w; c++) {
-        updateBounds(0, c);
-        updateBounds(h - 1, c);
-    }
-    for (int r = 1; r < h - 1; r++) {
-        updateBounds(r, 0);
-        updateBounds(r, w - 1);
-    }
-    for (int r = 32; r < h - 1; r += 32)
-        for (int c = 32; c < w - 1; c += 32)
-            updateBounds(r, c);
-
-    if (!found) return invalid;
-
-    loX -= 2.0f; loY -= 2.0f; loZ -= 2.0f;
-    hiX += 2.0f; hiY += 2.0f; hiZ += 2.0f;
-
-    const auto chunkShape = ds->chunkShape(level);
-    const auto shape = ds->shape(level);
-
-    ChunkRegion region;
-    region.minIx = std::max(0, int(std::floor(loX / double(chunkShape[2]))));
-    region.maxIx = std::min(int(std::ceil(hiX / double(chunkShape[2]))),
-                            int((shape[2] - 1) / chunkShape[2]));
-    region.minIy = std::max(0, int(std::floor(loY / double(chunkShape[1]))));
-    region.maxIy = std::min(int(std::ceil(hiY / double(chunkShape[1]))),
-                            int((shape[1] - 1) / chunkShape[1]));
-    region.minIz = std::max(0, int(std::floor(loZ / double(chunkShape[0]))));
-    region.maxIz = std::min(int(std::ceil(hiZ / double(chunkShape[0]))),
-                            int((shape[0] - 1) / chunkShape[0]));
-    return region;
-}
-
 static std::string loadCachedRemoteUrl(const std::filesystem::path& volumePath)
 {
     auto markerPath = volumePath / ".remote_source.json";
@@ -469,19 +389,17 @@ static bool pathsEquivalent(const std::filesystem::path& a, const std::filesyste
     return a.lexically_normal() == b.lexically_normal();
 }
 
-// Exact sample->chunk residency set (feedback-pass style, cf. sparse virtual
-// texturing / id Tech 5 MegaTexture): a chunk is needed iff it contains
-// floor(p) or floor(p)+1 on some axis (trilinear 8-voxel neighbourhood) for
-// some sample p = base + dir * off.  Replaces the previous axis-aligned
-// region fill, which fetched every chunk in the ring's bounding box
-// (measured on w129: 15,608 fetched vs 3,733 actually touched, 4.18x).
+// Chunks the samples actually reach: a chunk is needed exactly when it holds
+// floor(p) or floor(p)+1 on some axis -- the trilinear neighbourhood -- for
+// some sample p = base + dir * off. This replaces an axis-aligned region fill,
+// which for a band spanning a whole winding took the bounding box of an
+// annulus while the surface is a thin ring inside it.
 //
-// Deviation from the internal spec (which kept the stride-32 region as the
-// bitmap domain): the bitmap domain is derived from an exact full walk of
-// all samples instead, because computeChunkRegionForSamples() samples only
-// band borders + every 32nd interior point and can under-size a domain
-// defined by it.  The full walk is a guaranteed superset of everything the
-// renderer reads at these samples; acceptance is bitwise-identical output.
+// The bitmap domain comes from walking every sample rather than from the
+// region helper that used to serve here, because that helper sampled only the
+// band border and every 32nd interior point and could therefore under-size a
+// domain defined by it. Walking everything is a guaranteed superset of what
+// the renderer reads; the acceptance test is that the image is unchanged.
 static void insertExactChunksForSamples(
     const cv::Mat_<cv::Vec3f>& base,
     const cv::Mat_<cv::Vec3f>& dirs,
@@ -498,10 +416,16 @@ static void insertExactChunksForSamples(
     const int maxCy = int((shape[1] - 1) / chunkShape[1]);
     const int maxCz = int((shape[0] - 1) / chunkShape[0]);
 
+    // Clamp in double before narrowing. A coordinate TIFF holding something
+    // like FLT_MAX passes the isfinite check, and int(std::floor(3.4e38/128))
+    // is undefined: x86-64 yields INT_MIN, which then survives the `> maxC`
+    // test and poisons the bounds, while arm64 saturates to INT_MAX. Two
+    // architectures the project supports, two different behaviours.
     auto chunkOfVoxel = [](double v, double dim, int maxC) -> int {
         if (!(v >= 0.0)) v = 0.0;
-        int c = int(std::floor(v / dim));
-        return c > maxC ? maxC : c;
+        const double c = std::floor(v / dim);
+        if (!(c < double(maxC))) return maxC;
+        return int(c);
     };
 
     const int h = base.rows, w = base.cols;
@@ -1655,11 +1579,18 @@ int main(int argc, char *argv[])
                     && std::isfinite(derived) && derived > 0.0) {
                 const double exponent = std::log2(derived);
                 if (std::abs(exponent - std::round(exponent)) < 0.01) {
-                    seg_scale = float(derived);
+                    // Use the power of two, not the ratio that rounded to it.
+                    // The tolerance is 0.7% in the ratio, and the two voxel
+                    // sizes come from different files -- 7.91 against 7.9 gives
+                    // 1.00127, which passes and would then multiply every
+                    // coordinate by that instead of by exactly 1.
+                    const double snapped =
+                        std::ldexp(1.0, int(std::lround(exponent)));
+                    seg_scale = float(snapped);
                     logPrintf(stdout,
                         "Segmentation voxel size %g um, volume %g um: "
                         "using --scale-segmentation %g\n",
-                        segUm, base_voxel_size_um, derived);
+                        segUm, base_voxel_size_um, snapped);
                 } else {
                     logPrintf(stderr,
                         "Warning: the segmentation states %g um per voxel and "
