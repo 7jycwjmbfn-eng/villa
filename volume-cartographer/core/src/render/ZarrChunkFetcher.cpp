@@ -1140,7 +1140,8 @@ OpenedRemoteChunkedZarr openRemoteZarrPyramid(
 std::unique_ptr<ChunkCache> createChunkCache(
     OpenedChunkedZarr opened,
     std::size_t decodedByteCapacity,
-    std::size_t maxConcurrentReads)
+    std::size_t maxConcurrentReads,
+    std::optional<std::filesystem::path> persistentCachePath)
 {
     std::vector<ChunkCache::LevelInfo> levels;
     levels.reserve(opened.shapes.size());
@@ -1150,6 +1151,7 @@ std::unique_ptr<ChunkCache> createChunkCache(
 
     ChunkCache::Options options;
     options.zarrMirrorMetadata = std::move(opened.zarrMirrorMetadata);
+    options.persistentCachePath = std::move(persistentCachePath);
     ChunkCacheService::Options serviceOptions;
     serviceOptions.decodedByteCapacity = decodedByteCapacity;
     serviceOptions.fetchConcurrency.workerCapacity = maxConcurrentReads;
