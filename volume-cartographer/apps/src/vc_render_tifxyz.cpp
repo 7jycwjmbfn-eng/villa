@@ -1,5 +1,6 @@
 #include <iostream>
 #include "vc/core/util/Slicing.hpp"
+#include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
@@ -26,6 +27,8 @@
 #include <cctype>
 #include <chrono>
 #include <cstdarg>
+#include <climits>
+#include <cstdlib>
 #include <thread>
 #include <optional>
 #include <unordered_set>
@@ -590,6 +593,121 @@ static std::vector<vc::render::ChunkKey> collectPrefetchKeysForRows(
     });
     return keys;
 }
+
+// Check at run time that the prefetch plan covered every chunk the render
+// actually fetched.
+//
+// A sha256 over one winding's output proves that winding renders identically
+// under the plan; it says nothing about any other winding, scale or crop. The
+// cache already announces each source fetch with its key -- and only real
+// fetches, not persistent-cache probes or decoded hits -- so subscribing to
+// that turns a single checked example into the invariant the plan is supposed
+// to have: planned is a superset of fetched. A miss names the chunk, which is
+// where the planner would have to be wrong.
+//
+// Off unless VC_RENDER_VERIFY_PREFETCH is set, because it holds the whole plan
+// in a hash set and takes a lock on every fetch.
+class PrefetchAudit
+{
+public:
+    static bool requested()
+    {
+        const char* value = std::getenv("VC_RENDER_VERIFY_PREFETCH");
+        return value && *value && std::string(value) != "0";
+    }
+
+    PrefetchAudit(vc::render::IChunkedArray* array,
+                  const std::vector<vc::render::ChunkKey>& planned)
+        : cache_(dynamic_cast<vc::render::ChunkCache*>(array))
+    {
+        if (!cache_) {
+            logPrintf(stderr,
+                      "Prefetch audit: this volume is not served by a ChunkCache; "
+                      "not verifying\n");
+            return;
+        }
+        for (const auto& key : planned) planned_.insert(position(key));
+        listener_ = cache_->addRemoteFetchActivityListener(
+            [this](const vc::render::ChunkKey& key, bool active) {
+                if (!active) return;
+                const auto probe = position(key);
+                std::lock_guard<std::mutex> lock(mutex_);
+                ++events_;
+                if (!fetched_.insert(probe).second) return;   // retry of one seen
+                if (planned_.count(probe)) return;
+                if (samples_.size() < 64) samples_.push_back(probe);
+            });
+    }
+
+    ~PrefetchAudit()
+    {
+        if (cache_ && listener_) cache_->removeRemoteFetchActivityListener(listener_);
+    }
+
+    PrefetchAudit(const PrefetchAudit&) = delete;
+    PrefetchAudit& operator=(const PrefetchAudit&) = delete;
+
+    void report()
+    {
+        if (!cache_) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::size_t unplanned = 0;
+        for (const auto& key : fetched_) unplanned += planned_.count(key) ? 0 : 1;
+        std::size_t unfetched = 0;
+        for (const auto& key : planned_) unfetched += fetched_.count(key) ? 0 : 1;
+        logPrintf(stdout,
+                  "Prefetch audit: planned %zu, fetched %zu in %zu event(s); "
+                  "%zu fetched but not planned, %zu planned but never fetched\n",
+                  planned_.size(), fetched_.size(), events_, unplanned, unfetched);
+        if (!planned_.empty()) {
+            int lo[3] = {INT_MAX, INT_MAX, INT_MAX};
+            int hi[3] = {INT_MIN, INT_MIN, INT_MIN};
+            for (const auto& k : planned_) {
+                const int c[3] = {k.iz, k.iy, k.ix};
+                for (int a = 0; a < 3; ++a) {
+                    lo[a] = std::min(lo[a], c[a]);
+                    hi[a] = std::max(hi[a], c[a]);
+                }
+            }
+            logPrintf(stdout,
+                      "Prefetch audit: planned extent z %d..%d y %d..%d x %d..%d\n",
+                      lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]);
+        }
+        if (samples_.empty()) {
+            logPrintf(stdout,
+                      "Prefetch audit: %zu chunk(s) fetched in %zu event(s), all within the %zu planned\n",
+                      fetched_.size(), events_, planned_.size());
+            return;
+        }
+        logPrintf(stderr,
+                  "Prefetch audit: of %zu chunk(s) fetched, some were NOT among the %zu "
+                  "planned -- the plan is incomplete\n",
+                  fetched_.size(), planned_.size());
+        for (const auto& key : samples_) {
+            logPrintf(stderr, "  unplanned chunk level %d z %d y %d x %d\n",
+                      key.level, key.iz, key.iy, key.ix);
+        }
+    }
+
+private:
+    // The plan carries no source id -- prefetchChunks resolves the source from
+    // the cache -- while fetch notifications carry the real one, so comparing
+    // whole keys marks every fetch unplanned. Compare position only. Sound
+    // because one render reads one volume; it would need revisiting if a render
+    // ever mixed sources.
+    static vc::render::ChunkKey position(const vc::render::ChunkKey& key)
+    {
+        return vc::render::ChunkKey{key.level, key.iz, key.iy, key.ix};
+    }
+
+    vc::render::ChunkCache* cache_ = nullptr;
+    vc::render::ChunkCache::RemoteFetchActivityCallbackId listener_ = 0;
+    std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash> planned_;
+    std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash> fetched_;
+    std::vector<vc::render::ChunkKey> samples_;
+    std::mutex mutex_;
+    std::size_t events_ = 0;
+};
 
 static bool prefetchChunkKeys(
     vc::render::IChunkedArray* cache,
@@ -1783,6 +1901,8 @@ int main(int argc, char *argv[])
         // Inline pyramid only works without rotation/flip (accumulation assumes
         // source tile-rows map 1:1 to destination tile-rows for row-group flushing)
         const bool inlinePyramid = wantZarr && wantPyramid && !pre_flag && !hasRotFlip;
+        // Outlives the render pass: fetches keep arriving after prefetch returns.
+        std::optional<PrefetchAudit> prefetchAudit;
         std::vector<vc::VcDataset*> pyramidDs;
         std::vector<std::unique_ptr<vc::VcDataset>> pyramidOwned;
         if (wantZarr && wantPyramid && !pre_flag) {
@@ -1835,6 +1955,9 @@ int main(int argc, char *argv[])
                       prefetchKeys.size(),
                       rowStart,
                       rowEnd > rowStart ? rowEnd - 1 : rowStart);
+            if (PrefetchAudit::requested()) {
+                prefetchAudit.emplace(chunk_cache, prefetchKeys);
+            }
             if (!prefetchChunkKeys(chunk_cache, prefetchKeys)) {
                 return false;
             }
@@ -1928,6 +2051,8 @@ int main(int argc, char *argv[])
                     std::ldexp(1.0, group_idx), group_idx);
             }
         }
+
+        if (prefetchAudit) prefetchAudit->report();
 
         // ---- Zarr pyramid + attrs ----
         if (wantZarr && !pre_flag) {
